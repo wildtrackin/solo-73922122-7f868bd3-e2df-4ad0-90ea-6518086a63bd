@@ -1,0 +1,27 @@
+services:
+  recalc-api:
+    build: .
+    image: xlsx-recalc-service:latest
+    ports:
+      - "8000:8000"
+    environment:
+      # 单任务从启动重算起的硬时限（秒）
+      RECALC_RECALC_TIMEOUT: "60"
+      # 同时执行重算的任务数
+      RECALC_MAX_PARALLEL: "2"
+      RECALC_STORAGE_ROOT: "/data/tasks"
+    volumes:
+      # 样例工作簿目录：宿主机可直接取用三个演示 xlsx
+      - ./samples:/samples
+      # 任务数据隔离在容器卷内，避免污染宿主机
+      - recalc-data:/data
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  recalc-data:
