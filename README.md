@@ -20,6 +20,51 @@ LibreOffice 在后台**真正重新计算**工作簿，校验“测量”表的 
 | 60 秒硬时限 | 从取得槽位、启动 LibreOffice 起算（`started_at`），看门狗 + 等待循环双保险 |
 | 终止并回收 | 进程组 `SIGTERM`→等待→`SIGKILL`，并按任务专属 profile 路径 `pkill -f` 兜底；只影响本任务 |
 | 清理完成才报结束 | 工作簿/profile/管道暂存先清理，之后才把任务置为终态；结果 CSV 位于独立 `result/` 目录 |
+| 停机收尾 | `POST /admin/shutdown` 或进程收到 SIGTERM/SIGINT：开始关闭即拒绝新任务（503），排队任务不再启动，运行任务停止重算、不进入提取；线程/看门狗/重算进程全部回收后才清理暂存、结束关闭；重复关闭等待同一次收尾；已成功的 CSV 保留可下载 |
+
+## 停机收尾（维护关闭）
+
+实验室停机维护时，服务保证“API 关闭后，重算进程、排队线程和暂存全部收尾”：
+
+1. **开始关闭即拒绝新任务**：`POST /tasks` 立即返回 `503`（读取上传体之前）；
+   关闭开始后到达的创建请求不会在磁盘留下任何任务目录。
+2. **排队任务不再启动**：等槽位的线程检测到关闭后直接以
+   `cancelled`（`服务关闭：排队任务不再启动`）收尾，绝不放出新进程。
+3. **运行任务停止重算、不进入提取**：取消事件在 0.2s 内打断 UNO 等待循环，
+   进程组被终止回收，终态 `cancelled`（`服务关闭：重算已停止，未进入提取`）。
+4. **交错窗口同样安全**：关闭与进程创建交错时，创建中的“迟到进程”
+   照样被回收；关闭与重算完成交错时，不进入提取、未发布 CSV 绝不发布。
+5. **收尾顺序**：全部任务线程退出（线程退出即意味着其看门狗已 join、
+   所属 LibreOffice/UNO 进程组已终止回收）后，才清理未完成任务暂存、
+   结束关闭；`/health` 的 `shutting_down` / `shutdown_completed` 可查进度。
+6. **重复关闭等待同一次收尾**：`POST /admin/shutdown` 幂等，并发/重复
+   调用阻塞至同一次收尾完成，返回同一份汇总（`already_completed=true`）。
+7. **关闭前已成功的 CSV 保留**：`succeeded` 任务的结果文件与下载能力
+   不受关闭影响。
+
+触发方式（两种等价，内部走同一收尾逻辑）：
+
+```bash
+# 方式一：HTTP 维护入口（阻塞至收尾完成，返回汇总 JSON）
+curl -X POST http://127.0.0.1:8000/admin/shutdown
+
+# 方式二：进程信号（docker stop / kubectl 滚动更新）
+docker compose stop recalc-api   # compose 已配置 stop_grace_period: 45s
+```
+
+汇总 JSON 示例：
+
+```json
+{
+  "status": "completed",
+  "duration_seconds": 0.225,
+  "threads_joined": 3,
+  "incomplete_task_ids": ["…被收尾取消的在途任务…"],
+  "retained_succeeded_ids": ["…关闭前已成功、结果保留的任务…"],
+  "staging_cleaned_ids": ["…暂存已清理/核验的任务…"],
+  "already_completed": false
+}
+```
 
 ## 目录结构
 
@@ -30,13 +75,15 @@ app/
   processes.py     任务目录、进程组终止、暂存清理
   recalc_uno.py    LibreOffice 内执行的 UNO 重算脚本
   extractor.py     重算结果校验与只含值 CSV 生成
-  runner.py        线程编排、信号量、取消、看门狗、回收
-  main.py          FastAPI 路由
+  runner.py        线程编排、信号量、取消、看门狗、回收、停机收尾
+  main.py          FastAPI 路由（含 /admin/shutdown 与 lifespan 收尾）
 samples/
   generate_samples.py  样例工作簿生成器
 docker/entrypoint.sh
-tests/             21 个 pytest 用例（含假 soffice/UNO 进程）
-scripts/demo.sh    curl 端到端演示
+tests/             30 个 pytest 用例（含假 soffice/UNO 进程）
+scripts/demo.sh                  上传/并行/取消/下载演示
+scripts/demo_shutdown.sh         停机收尾演示（2 重算 + 1 排队时关闭）
+scripts/demo_shutdown_handoff.sh 进程创建交接点关闭的可控演示
 ```
 
 ## 启动（Docker Compose）
@@ -67,6 +114,30 @@ python3 samples/generate_samples.py --out-dir samples --delay-k 20000000
 > 容器内重算耗时与 CPU 相关；默认 `K=3,000,000` 通常为亚秒到数秒，
 > 调到 `20,000,000~50,000,000` 可稳定制造超过取消窗口/60 秒的任务。
 
+## 演示脚本
+
+```bash
+# 基础流程：上传 → 并行 → 取消 → 下载
+./scripts/demo.sh
+
+# 停机收尾：两个任务重算中、一个任务排队时发起关闭
+./scripts/demo_shutdown.sh
+
+# 可控演示：在“进程创建交接点”发起关闭（迟到进程照样被回收）
+./scripts/demo_shutdown_handoff.sh
+```
+
+`demo_shutdown.sh` 依次验证：503 拒绝新任务、三个在途任务全部
+`cancelled`（排队未启动、运行停止未提取）、关闭前成功的 CSV 仍可下载、
+容器内无 soffice/UNO 进程残留、暂存目录清空、重复关闭返回
+`already_completed=true`。
+
+`demo_shutdown_handoff.sh` 使用带放行门的演示服务
+（`recalc-api-gated`，profile `gate-demo`，端口 8001）：任务线程在启动
+LibreOffice 前等待“放行文件”，脚本在此时发起关闭，再创建放行文件——
+进程创建在关闭开始后才完成（迟到进程），收尾照样把它回收，
+容器日志可见 `取消/关闭与进程创建交错：回收迟到的 soffice pid=…`。
+
 ## API 速览
 
 ```bash
@@ -82,6 +153,13 @@ curl -X POST http://127.0.0.1:8000/tasks/<task_id>/cancel
 
 # 仅 succeeded 可下载，否则 409
 curl -OJ http://127.0.0.1:8000/tasks/<task_id>/download
+
+# 停机收尾（幂等，阻塞至回收完成；此后 /tasks 返回 503）
+curl -X POST http://127.0.0.1:8000/admin/shutdown
+
+# 健康检查（含关闭状态）
+curl http://127.0.0.1:8000/health
+# => {"status":"ok","max_parallel":2,"shutting_down":false,"shutdown_completed":false}
 ```
 
 CSV 格式（UTF-8、无公式、无缓存标记）：
@@ -115,7 +193,11 @@ PYTHONPATH=. pytest -q
 
 测试覆盖：成功 CSV、并行上限与目录隔离、运行中/排队取消且不发布、
 60s（测试中缩短为 2s）超时回收、重算失败、公式错误、非有限值、
-缺表缺列、过期缓存防线、终态取消冲突、进程组回收与三个样例结构。
+缺表缺列、过期缓存防线、终态取消冲突、进程组回收与三个样例结构；
+停机收尾：关闭后拒绝新任务（manager 异常 / API 503）、2 运行 + 1 排队
+时关闭全部取消、进程创建交接点关闭时迟到进程被回收、重算完成交接点
+关闭时不进入提取且不发布、重复/并发关闭等待同一次收尾、关闭前成功的
+CSV 保留可下载。
 
 ## 配置（环境变量）
 
@@ -127,3 +209,6 @@ PYTHONPATH=. pytest -q
 | `RECALC_STORAGE_ROOT` | `/data/tasks` | 任务隔离存储根目录 |
 | `SOFFICE_BIN` | `soffice` | LibreOffice 可执行文件（测试钩子） |
 | `RECALC_SCRIPT_OVERRIDE` | 未设置 | 替换 UNO 脚本（测试钩子，生产不设置） |
+| `RECALC_LAUNCH_GATE` | 未设置 | “进程创建交接点”放行门文件（演示/测试钩子，生产不设置） |
+| `RECALC_PRE_EXTRACT_GATE` | 未设置 | “重算完成→提取交接点”放行门文件（演示/测试钩子，生产不设置） |
+| `RECALC_GATE_TIMEOUT` | `30` | 放行门最长等待秒数（超时继续正常流程） |

@@ -1,10 +1,12 @@
-"""FastAPI 入口：上传、状态、取消、下载。"""
+"""FastAPI 入口：上传、状态、取消、下载与停机收尾。"""
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import zipfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, UploadFile
@@ -13,13 +15,25 @@ from fastapi.responses import FileResponse
 from .config import settings
 from .extractor import WorkbookError
 from .models import TaskStatus
-from .runner import TaskManager
+from .runner import ShutdownInProgress, TaskManager
 
 logger = logging.getLogger("recalc.api")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # 进程收到 SIGTERM/SIGINT（如 docker stop）时执行停机收尾：
+    # 拒绝新任务、取消在途任务，等待任务线程/看门狗/重算进程全部
+    # 回收并清理未完成任务暂存后才真正退出。
+    yield
+    logger.info("API 关闭：开始任务线程与重算进程收尾")
+    summary = await asyncio.to_thread(manager.shutdown)
+    logger.info("停机收尾完成: %s", summary)
+
 
 app = FastAPI(
     title="测量工作簿重算服务",
@@ -28,8 +42,11 @@ app = FastAPI(
         "“测量”表（corrected 公式可引用同簿“校准”表），"
         "成功后下载只含值的 CSV。最多两个任务并行，"
         "支持状态查询、取消与 60 秒重算硬时限。"
+        "维护停机走 `POST /admin/shutdown`：开始关闭即拒绝新任务，"
+        "在途任务回收、暂存清理完成后才结束关闭。"
     ),
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 manager = TaskManager(settings)
@@ -67,6 +84,11 @@ def _validate_xlsx_container(data: bytes, filename: str) -> None:
 
 @app.post("/tasks", status_code=202, summary="上传工作簿并创建重算任务")
 async def create_task(file: UploadFile) -> dict:
+    # 开始关闭即拒绝新任务（读取上传体之前就拒绝）
+    if manager.shutting_down:
+        raise HTTPException(
+            status_code=503, detail="服务正在关闭，不再接受新任务"
+        )
     data = _read_limited(file, settings.max_upload_bytes)
     if not data:
         raise HTTPException(status_code=400, detail="上传内容为空")
@@ -77,6 +99,9 @@ async def create_task(file: UploadFile) -> dict:
         record = manager.create_task(file.filename or "upload.xlsx", data)
     except WorkbookError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ShutdownInProgress as exc:
+        # 校验期间关闭开始：同样拒绝，不留下任何任务目录
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return record.to_public() | {"links": _task_links(record.task_id)}
 
 
@@ -137,7 +162,31 @@ async def download_result(task_id: str):
 
 @app.get("/health", summary="健康检查")
 async def health() -> dict:
-    return {"status": "ok", "max_parallel": settings.max_parallel}
+    return {
+        "status": "ok",
+        "max_parallel": settings.max_parallel,
+        "shutting_down": manager.shutting_down,
+        "shutdown_completed": manager.shutdown_completed,
+    }
+
+
+@app.post(
+    "/admin/shutdown",
+    summary="停机收尾：拒绝新任务，回收在途任务并清理暂存",
+)
+async def admin_shutdown() -> dict:
+    """维护窗口入口（幂等，可重复调用）。
+
+    - 开始关闭即拒绝新任务（`POST /tasks` 返回 503）；
+    - 排队任务不再启动；运行任务停止重算、不进入提取；
+    - 关闭与进程创建/重算完成交错时，迟到进程同样回收，
+      未发布 CSV 不发布；
+    - 全部任务线程、看门狗与重算进程退出并回收后，清理未完成
+      任务暂存，收尾才结束（本请求阻塞至收尾完成并返回汇总）；
+    - 重复调用等待同一次收尾；关闭前已成功的 CSV 保留、可下载。
+    """
+    logger.info("收到停机请求，开始收尾")
+    return await asyncio.to_thread(manager.shutdown)
 
 
 def _task_links(task_id: str) -> dict:

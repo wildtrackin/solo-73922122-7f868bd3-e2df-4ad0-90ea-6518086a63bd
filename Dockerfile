@@ -6,7 +6,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     RECALC_STORAGE_ROOT=/data/tasks
 
-# libreoffice-nogui 提供 soffice 与 python3-uno（系统 python3 可 import uno）
+# libreoffice-nogui 提供 soffice 与 python3-uno（系统 python3 可 import uno）；
+# procps 提供 pkill/pgrep：按任务 profile 路径兜底回收残留 soffice，
+# 也便于演示时核验“重算进程已全部回收”。
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 \
         python3-pip \
@@ -14,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libreoffice-calc \
         python3-uno \
         ca-certificates \
+        procps \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv

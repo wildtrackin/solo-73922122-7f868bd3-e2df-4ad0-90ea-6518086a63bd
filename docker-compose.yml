@@ -21,7 +21,42 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+    # docker stop 时给停机收尾留足时间：取消在途任务 → 终止并回收
+    # LibreOffice 进程组（SIGTERM→SIGKILL 有界等待）→ 清理暂存后才退出
+    stop_grace_period: 45s
+    restart: unless-stopped
+
+  # 可控演示服务：在“进程创建交接点”挂放行门（RECALC_LAUNCH_GATE），
+  # 用于演示关闭与进程创建交错时迟到进程仍被回收。
+  # 仅在启用 gate-demo profile 时启动：
+  #   docker compose --profile gate-demo up -d recalc-api-gated
+  # 演示脚本 scripts/demo_shutdown_handoff.sh 会自动处理。
+  recalc-api-gated:
+    build: .
+    image: xlsx-recalc-service:latest
+    profiles: ["gate-demo"]
+    ports:
+      - "8001:8000"
+    environment:
+      RECALC_RECALC_TIMEOUT: "60"
+      RECALC_MAX_PARALLEL: "2"
+      RECALC_STORAGE_ROOT: "/data/tasks"
+      # 任务线程启动 LibreOffice 前等待该“放行文件”出现（有界等待），
+      # 等待期间写 /data/tasks/.launch_gate.waiting 标记供外部同步
+      RECALC_LAUNCH_GATE: "/data/tasks/.launch_gate"
+      RECALC_GATE_TIMEOUT: "180"
+    volumes:
+      - ./samples:/samples
+      - recalc-data-gate:/data
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    stop_grace_period: 200s
     restart: unless-stopped
 
 volumes:
   recalc-data:
+  recalc-data-gate:

@@ -10,6 +10,10 @@
 禁止信号，因此本脚本额外监听任务管道目录下的 .terminate 标记文件
 （runner 在信号不可用时写入），收到后自行退出，保证测试可在沙箱内
 验证“终止—回收—清理—报结束”的完整顺序。
+
+  FAKE_SOFFICE_SPAWN_LOG  设为文件路径时，进程启动/退出各写一行，
+                          用于证明“关闭与进程创建交错时，迟到进程
+                          被创建后也被回收”。
 """
 
 import os
@@ -17,6 +21,17 @@ import signal
 import sys
 import time
 from pathlib import Path
+
+
+def _spawn_log(message: str) -> None:
+    path = os.environ.get("FAKE_SOFFICE_SPAWN_LOG")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{message} pid={os.getpid()}\n")
+    except OSError:
+        pass
 
 
 def _terminate_marker() -> Path | None:
@@ -28,6 +43,7 @@ def _terminate_marker() -> Path | None:
 
 
 def main() -> int:
+    _spawn_log("start")
     if os.environ.get("FAKE_SOFFICE_IGNORE_TERM") != "1":
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 
@@ -58,4 +74,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = 1
+    try:
+        rc = main()
+    finally:
+        # SIGTERM 处理函数的 sys.exit 也会经过这里；SIGKILL 除外
+        _spawn_log("exit")
+    sys.exit(rc)

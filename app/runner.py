@@ -1,11 +1,16 @@
-"""重算任务编排：并发槽位、取消、60s 硬时限与终止回收。
+"""重算任务编排：并发槽位、取消、60s 硬时限、终止回收与停机收尾。
 
 关键保证：
 1. 最多 ``RECALC_MAX_PARALLEL`` 个任务真正进入重算，其余排队；
 2. 60s 从“启动重算”（取得槽位、LibreOffice 启动）起算，排队时间不计；
 3. 取消、超时、失败都会终止本任务进程组并清理全部暂存，再把任务置为终态；
 4. 取消一经受理，即便重算随后完成也不会发布结果；
-5. 任务间目录、LibreOffice profile、UNO 管道完全隔离。
+5. 任务间目录、LibreOffice profile、UNO 管道完全隔离；
+6. 停机收尾（shutdown）：开始关闭即拒绝新任务；排队任务不再启动；
+   运行任务停止重算、不进入提取；关闭与进程创建或重算完成交错时，
+   迟到进程同样被回收、未发布 CSV 绝不发布；全部任务线程、看门狗与
+   所属重算进程退出并回收后，才清理未完成任务暂存、结束关闭；
+   重复关闭等待同一次收尾；关闭前已成功的 CSV 保留。
 """
 
 from __future__ import annotations
@@ -21,7 +26,7 @@ from pathlib import Path
 
 from .config import Settings, settings as default_settings
 from .extractor import WorkbookError, extract_to_csv, validate_structure
-from .models import TaskRecord, TaskStatus
+from .models import TERMINAL_STATUSES, TaskRecord, TaskStatus
 from .processes import (
     WorkDirs,
     cleanup_work_dirs,
@@ -32,6 +37,10 @@ from .processes import (
 logger = logging.getLogger("recalc.runner")
 
 RECALC_SCRIPT = Path(__file__).with_name("recalc_uno.py")
+
+# 交接点放行门轮询间隔与默认最长等待（测试/演示钩子）
+GATE_POLL_INTERVAL = 0.05
+DEFAULT_GATE_TIMEOUT = 30.0
 
 
 class RecalcError(Exception):
@@ -44,6 +53,10 @@ class TaskCancelled(Exception):
 
 class RecalcTimeout(Exception):
     """60s 硬时限到期。"""
+
+
+class ShutdownInProgress(Exception):
+    """停机收尾已开始，拒绝新任务。"""
 
 
 def _resolve_lo_python() -> str:
@@ -137,6 +150,49 @@ def _pkill_profile(profile_dir: Path) -> None:
         pass
 
 
+def _gate_timeout() -> float:
+    raw = os.environ.get("RECALC_GATE_TIMEOUT", "")
+    try:
+        return float(raw) if raw.strip() else DEFAULT_GATE_TIMEOUT
+    except ValueError:
+        return DEFAULT_GATE_TIMEOUT
+
+
+def _await_handoff_gate(gate: Path, label: str) -> None:
+    """测试/演示钩子：在交接点等待“放行文件”出现（有界），随后继续正常流程。
+
+    等待期间在 ``<gate>.waiting`` 放置标记文件，供外部精确同步“线程已
+    抵达交接点”。该钩子只把交接窗口拉开，不改变取消/关闭语义——放行后
+    既有的 cancel_event 检查点照常生效：关闭与进程创建交错时，迟到进程
+    由 finally 回收；关闭与重算完成交错时，不进入提取、结果不发布。
+    生产环境不设置对应环境变量，本函数不会被调用。
+    """
+    waiting_marker = gate.with_name(gate.name + ".waiting")
+    timeout = _gate_timeout()
+    try:
+        waiting_marker.touch()
+    except OSError:
+        pass
+    logger.info("%s：等待放行文件 %s（最长 %.1fs）", label, gate, timeout)
+    released = False
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            if gate.exists():
+                released = True
+                break
+            time.sleep(GATE_POLL_INTERVAL)
+    finally:
+        try:
+            waiting_marker.unlink()
+        except OSError:
+            pass
+    if released:
+        logger.info("%s：已放行，继续流程", label)
+    else:
+        logger.warning("%s：等待放行超时（%.1fs），继续流程", label, timeout)
+
+
 def run_pipeline(
     dirs: WorkDirs,
     cancel_event: threading.Event,
@@ -169,9 +225,18 @@ def run_pipeline(
             raise TaskCancelled("cancelled before recalc start")
 
         # —— 启动重算（60s 计时的起点已在调用方标记）——
+        # 演示/测试钩子：把“进程创建交接点”拉开，可控验证关闭与进程创建
+        # 交错时迟到进程仍被回收（生产不设置 RECALC_LAUNCH_GATE）。
+        launch_gate = os.environ.get("RECALC_LAUNCH_GATE")
+        if launch_gate:
+            _await_handoff_gate(Path(launch_gate), "进程创建交接点")
         soffice_proc = _launch_soffice(cfg, dirs, log_path)
 
         if cancel_event.is_set():
+            logger.warning(
+                "取消/关闭与进程创建交错：回收迟到的 soffice pid=%s",
+                soffice_proc.pid,
+            )
             raise TaskCancelled("cancelled while starting LibreOffice")
 
         script_proc = _run_uno_script(cfg, dirs, log_path)
@@ -208,6 +273,12 @@ def run_pipeline(
 
         # —— 重算成功后做严格校验，任何不合格值整批失败 ——
         # 60s 硬时限同样覆盖提取阶段
+        # 演示/测试钩子：把“重算完成→提取”交接点拉开，可控验证关闭与
+        # 重算完成交错时不进入提取、未发布 CSV 绝不发布
+        # （生产不设置 RECALC_PRE_EXTRACT_GATE）。
+        extract_gate = os.environ.get("RECALC_PRE_EXTRACT_GATE")
+        if extract_gate:
+            _await_handoff_gate(Path(extract_gate), "提取交接点")
         if cancel_event.is_set():
             if timeout_fired.is_set():
                 raise RecalcTimeout(
@@ -244,6 +315,13 @@ def run_pipeline(
                 soffice_proc.wait(timeout=10.0)
             except subprocess.TimeoutExpired:
                 logger.warning("soffice did not exit within grace period")
+        reaped = [p.pid for p in (script_proc, soffice_proc) if p is not None]
+        if reaped:
+            logger.info(
+                "任务 %s：重算进程已全部终止回收 pids=%s",
+                dirs.root.name,
+                reaped,
+            )
 
 
 class TaskManager:
@@ -253,8 +331,28 @@ class TaskManager:
         self._cfg = cfg
         self._records: dict[str, TaskRecord] = {}
         self._cancel_events: dict[str, threading.Event] = {}
+        self._threads: dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
         self._slots = threading.BoundedSemaphore(cfg.max_parallel)
+        # 停机收尾状态机：
+        # - _shutdown_event 一旦置位即拒绝新任务、取消全部在途任务；
+        # - _shutdown_lock 串行化收尾执行，重复/并发关闭等待同一次收尾；
+        # - _shutdown_done 在全部任务线程、看门狗与重算进程退出回收、
+        #   未完成任务暂存清理完成后置位。
+        self._shutdown_event = threading.Event()
+        self._shutdown_done = threading.Event()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_result: dict | None = None
+
+    @property
+    def shutting_down(self) -> bool:
+        """关闭是否已开始（此时起拒绝新任务）。"""
+        return self._shutdown_event.is_set()
+
+    @property
+    def shutdown_completed(self) -> bool:
+        """收尾是否已完成（线程/进程全部回收、暂存清理完毕）。"""
+        return self._shutdown_done.is_set()
 
     def validate_upload(self, workbook_bytes: bytes) -> None:
         """结构预校验（临时文件，随用随删），不合格抛 WorkbookError。"""
@@ -281,16 +379,25 @@ class TaskManager:
             work_dir=str(dirs.root),
         )
         event = threading.Event()
-        with self._lock:
-            self._records[task_id] = record
-            self._cancel_events[task_id] = event
         thread = threading.Thread(
             target=self._worker,
             args=(task_id, dirs, event),
             name=f"recalc-{task_id}",
             daemon=True,
         )
-        thread.start()
+        with self._lock:
+            rejecting = self._shutdown_event.is_set()
+            if not rejecting:
+                self._records[task_id] = record
+                self._cancel_events[task_id] = event
+                # 线程先登记再启动：关闭快照要么看到完整登记的线程并 join，
+                # 要么先置位令本任务被拒绝——不存在漏登记、漏 join 的线程
+                self._threads[task_id] = thread
+                thread.start()
+        if rejecting:
+            # 关闭已开始：拒绝新任务并清掉刚创建的暂存，绝不遗留
+            shutil.rmtree(dirs.root, ignore_errors=True)
+            raise ShutdownInProgress("服务正在关闭，不再接受新任务")
         return record
 
     def get(self, task_id: str) -> TaskRecord | None:
@@ -321,6 +428,97 @@ class TaskManager:
                 record.detail = "取消已受理，正在终止 LibreOffice"
             return not already, record.detail
 
+    def _cancel_detail(self, shutdown_text: str, normal_text: str) -> str:
+        """取消详情：若因停机收尾触发，使用关闭语义文案。"""
+        return shutdown_text if self._shutdown_event.is_set() else normal_text
+
+    def shutdown(self) -> dict:
+        """停机收尾：拒绝新任务，取消在途任务并等待全部回收后清理暂存。
+
+        顺序保证：
+          1. 置位关闭标记——开始关闭即拒绝新任务；
+          2. 置位全部任务的取消事件——排队任务不再启动，运行任务停止
+             重算、不进入提取，未发布 CSV 不发布；
+          3. join 全部任务线程——线程退出即意味着其看门狗已 join、
+             所属 LibreOffice/UNO 进程组已终止回收、暂存已清理；
+          4. 兜底核验未完成任务暂存清理完毕（关闭前成功的 CSV 保留）；
+          5. 标记收尾完成。
+        幂等：重复/并发调用在 ``_shutdown_lock`` 上等待同一次收尾，
+        并拿到同一份汇总（``already_completed=True``）。
+        """
+        with self._shutdown_lock:
+            if self._shutdown_result is not None:
+                return {**self._shutdown_result, "already_completed": True}
+
+            began = time.monotonic()
+            with self._lock:
+                self._shutdown_event.set()
+                events = list(self._cancel_events.values())
+                threads = list(self._threads.values())
+                incomplete_ids: list[str] = []
+                retained_ids: list[str] = []
+                for record in self._records.values():
+                    if record.status == TaskStatus.SUCCEEDED:
+                        # 关闭前已成功：结果保留，可继续下载
+                        retained_ids.append(record.task_id)
+                    elif record.status in (
+                        TaskStatus.QUEUED,
+                        TaskStatus.RUNNING,
+                        TaskStatus.CANCELLING,
+                    ):
+                        incomplete_ids.append(record.task_id)
+                        record.status = TaskStatus.CANCELLING
+                        record.detail = "服务关闭：等待任务收尾"
+                for event in events:
+                    event.set()
+            logger.info(
+                "停机收尾开始：取消 %d 个在途任务，等待 %d 个任务线程退出",
+                len(incomplete_ids),
+                len(threads),
+            )
+
+            # 等待全部任务线程退出。每个线程的 finally 保证：看门狗已
+            # join、本任务进程组已终止回收、暂存已清理——join 返回即
+            # “线程、看门狗、重算进程全部退出并回收”。
+            for thread in threads:
+                thread.join()
+
+            # 兜底落定与核验（正常路径下线程已自行完成，此处幂等）：
+            # 未完成任务一律无暂存、无可下载结果；成功任务结果保留。
+            with self._lock:
+                for record in self._records.values():
+                    if record.status not in TERMINAL_STATUSES:
+                        record.status = TaskStatus.CANCELLED
+                        record.detail = "服务关闭：已取消"
+                        record.finished_at = time.monotonic()
+                records = list(self._records.values())
+            staging_cleaned: list[str] = []
+            for record in records:
+                if record.status == TaskStatus.SUCCEEDED or not record.work_dir:
+                    continue
+                root = Path(record.work_dir)
+                cleanup_work_dirs(root / "work")
+                try:
+                    csv_path = root / "result" / "result.csv"
+                    if csv_path.exists():
+                        csv_path.unlink()
+                except OSError:
+                    pass
+                staging_cleaned.append(record.task_id)
+
+            summary = {
+                "status": "completed",
+                "duration_seconds": round(time.monotonic() - began, 3),
+                "threads_joined": len(threads),
+                "incomplete_task_ids": incomplete_ids,
+                "retained_succeeded_ids": retained_ids,
+                "staging_cleaned_ids": staging_cleaned,
+            }
+            self._shutdown_result = summary
+            self._shutdown_done.set()
+            logger.info("停机收尾完成: %s", summary)
+            return {**summary, "already_completed": False}
+
     def _set_running(self, record: TaskRecord) -> bool:
         """标记运行中并开始 60s 计时；若取消已受理则返回 False。"""
         with self._lock:
@@ -341,29 +539,38 @@ class TaskManager:
         final_status: TaskStatus | None = None
         detail = ""
         try:
-            # 排队等槽位；排队期间也可被取消
+            # 排队等槽位；排队期间也可被取消/关闭
             while not self._slots.acquire(timeout=0.5):
                 if cancel_event.is_set():
                     final_status = TaskStatus.CANCELLED
-                    detail = "排队期间取消"
+                    detail = self._cancel_detail(
+                        "服务关闭：排队任务不再启动", "排队期间取消"
+                    )
                     return
             acquired = True
 
             if cancel_event.is_set():
                 final_status = TaskStatus.CANCELLED
-                detail = "取得槽位前已取消"
+                detail = self._cancel_detail(
+                    "服务关闭：排队任务不再启动", "取得槽位前已取消"
+                )
                 return
 
             if not self._set_running(record):
                 final_status = TaskStatus.CANCELLED
-                detail = "启动前已取消"
+                detail = self._cancel_detail(
+                    "服务关闭：任务未启动", "启动前已取消"
+                )
                 return
 
             try:
                 row_count = run_pipeline(dirs, cancel_event, self._cfg)
             except TaskCancelled as exc:
                 final_status = TaskStatus.CANCELLED
-                detail = str(exc) or "任务已取消"
+                detail = self._cancel_detail(
+                    "服务关闭：重算已停止，未进入提取",
+                    str(exc) or "任务已取消",
+                )
                 return
             except RecalcTimeout as exc:
                 final_status = TaskStatus.TIMED_OUT
@@ -385,9 +592,11 @@ class TaskManager:
 
             with self._lock:
                 if cancel_event.is_set() or record.status == TaskStatus.CANCELLING:
-                    # 取消在最后一刻受理：结果永不发布
+                    # 取消/关闭在最后一刻受理：结果永不发布
                     final_status = TaskStatus.CANCELLED
-                    detail = "取消先于结果发布被受理"
+                    detail = self._cancel_detail(
+                        "服务关闭：结果不予发布", "取消先于结果发布被受理"
+                    )
                     return
                 record.status = TaskStatus.SUCCEEDED
                 record.row_count = row_count
@@ -418,6 +627,8 @@ class TaskManager:
                             dirs.result_csv.unlink()
                     except OSError:
                         pass
+                # 从线程登记表注销，供停机收尾 join 统计
+                self._threads.pop(task_id, None)
             logger.info(
                 "task %s finished as %s: %s",
                 task_id,

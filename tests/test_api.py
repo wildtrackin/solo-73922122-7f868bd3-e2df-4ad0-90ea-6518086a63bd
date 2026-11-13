@@ -130,4 +130,9 @@ def test_download_only_when_succeeded(client, tmp_path, monkeypatch):
 
 
 def test_health(client):
-    assert client.get("/health").json() == {"status": "ok", "max_parallel": 2}
+    assert client.get("/health").json() == {
+        "status": "ok",
+        "max_parallel": 2,
+        "shutting_down": False,
+        "shutdown_completed": False,
+    }

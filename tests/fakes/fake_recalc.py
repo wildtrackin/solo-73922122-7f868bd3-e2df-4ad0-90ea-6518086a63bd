@@ -18,6 +18,16 @@ import shutil
 import sys
 import time
 import zipfile
+from pathlib import Path
+
+
+def _terminate_marker() -> Path | None:
+    # 工作目录即任务 work 目录（runner 以 cwd=work_dir 启动）；
+    # runner 在信号不可用时写入 .terminate 标记，收到后自行退出，
+    # 保证受限沙箱内取消/关闭也能及时收尾。
+    cwd = Path.cwd()
+    marker = cwd / "pipe" / ".terminate"
+    return marker if marker.parent.is_dir() else None
 
 
 def _strip_formula_caches(input_path: str, output_path: str) -> None:
@@ -44,9 +54,12 @@ def _strip_formula_caches(input_path: str, output_path: str) -> None:
 def main() -> int:
     _conn_url, input_path, output_path = sys.argv[1], sys.argv[2], sys.argv[3]
     delay = float(os.environ.get("FAKE_RECALC_DELAY", "0"))
+    marker = _terminate_marker()
     end = time.monotonic() + delay
     while time.monotonic() < end:
         time.sleep(0.05)
+        if marker is not None and marker.exists():
+            return 143
 
     if os.environ.get("FAKE_RECALC_FAIL") == "1":
         print("fake recalc formula error", file=sys.stderr)
